@@ -14,28 +14,35 @@ public class PackageReceiver extends BroadcastReceiver {
         if (pkg == null) return;
         if (pkg.equals(context.getPackageName())) return;
 
-        FixerLog.i("Package event: " + intent.getAction() + " -> " + pkg);
+        String action = intent.getAction();
+        boolean isReplace = Intent.ACTION_PACKAGE_REPLACED.equals(action);
+
+        FixerLog.i("Package event: " + action + " -> " + pkg);
 
         PendingResult pending = goAsync();
         new Thread(() -> {
             try {
-                // Wait 2s for system's MediaProvider to finish (or fail)
-                // This prevents race condition with FUSE dentry caching
-                FixerLog.i("Waiting 2s for MediaProvider to settle...");
+                // Wait 2s for system MediaProvider to settle
+                FixerLog.i("Waiting 2s for MediaProvider...");
                 Thread.sleep(2000);
 
-                // Pass 1: Initial fix on lower filesystem
+                // Pass 1
                 FixerLog.i("Pass 1 for " + pkg);
                 StorageFixer.fixPackage(pkg);
 
-                // Wait 3s for app to create its own subdirectories
+                // Wait 3s for app to create subdirs
                 Thread.sleep(3000);
 
-                // Pass 2: Fix any subdirs the app created with wrong perms
+                // Pass 2
                 FixerLog.i("Pass 2 for " + pkg);
                 StorageFixer.FixResult r = StorageFixer.fixPackage(pkg);
 
-                // Trigger media rescan so FUSE picks up changes
+                // Force stop (especially important for reinstalls)
+                if (isReplace) {
+                    StorageFixer.forceStopPackage(pkg);
+                }
+
+                // Trigger media rescan
                 StorageFixer.triggerMediaRescan(pkg);
 
                 FixerLog.i("Auto-fix complete: " + r);
