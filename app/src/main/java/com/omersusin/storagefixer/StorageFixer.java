@@ -53,27 +53,62 @@ public class StorageFixer {
     public static boolean needsFix(String pkg) {
         for (String type : DIR_TYPES) {
             String lowerPath = LOWER + "/" + type + "/" + pkg;
-
-            // Check if directory exists on lower FS
             Shell.Result exists = Shell.cmd(
                 "[ -d '" + lowerPath + "' ] && echo Y || echo N"
             ).exec();
             if (exists.getOut().isEmpty() || "N".equals(exists.getOut().get(0))) {
-                FixerLog.d("  Needs fix: " + lowerPath + " MISSING");
                 return true;
             }
 
-            // Check if FUSE can see it
             String fusePath = FUSE + "/" + type + "/" + pkg;
             Shell.Result fuseExists = Shell.cmd(
                 "[ -d '" + fusePath + "' ] && echo Y || echo N"
             ).exec();
             if (fuseExists.getOut().isEmpty() || "N".equals(fuseExists.getOut().get(0))) {
-                FixerLog.d("  Needs fix: " + fusePath + " not on FUSE");
                 return true;
             }
         }
         return false;
+    }
+
+    // ========== CHECK IF NEEDS APPOPS FIX ==========
+
+    private static boolean needsAppopsFix(String pkg) {
+        Shell.Result res = Shell.cmd(
+            "appops get " + pkg + " LEGACY_STORAGE 2>/dev/null"
+        ).exec();
+        if (!res.getOut().isEmpty()) {
+            String out = res.getOut().get(0);
+            if (out.contains("deny") || out.contains("ignore") || out.contains("default")) {
+                return true;
+            }
+        }
+
+        Shell.Result res2 = Shell.cmd(
+            "appops get " + pkg + " MANAGE_EXTERNAL_STORAGE 2>/dev/null"
+        ).exec();
+        if (!res2.getOut().isEmpty()) {
+            String out = res2.getOut().get(0);
+            if (out.contains("deny") || out.contains("ignore") || out.contains("default")) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    // ========== FIX APPOPS (FileProvider/Storage Access) ==========
+
+    public static void fixAppops(String pkg) {
+        FixerLog.i("Fixing appops for " + pkg);
+
+        Shell.cmd("appops set --uid " + pkg + " LEGACY_STORAGE allow").exec();
+        Shell.cmd("appops set --uid " + pkg + " NO_ISOLATED_STORAGE allow").exec();
+        Shell.cmd("appops set " + pkg + " READ_EXTERNAL_STORAGE allow").exec();
+        Shell.cmd("appops set " + pkg + " WRITE_EXTERNAL_STORAGE allow").exec();
+        Shell.cmd("appops set " + pkg + " MANAGE_EXTERNAL_STORAGE allow").exec();
+
+        FixerLog.i("Appops fixed for " + pkg);
     }
 
     // ========== FIX PACKAGE ==========
@@ -100,19 +135,20 @@ public class StorageFixer {
             logPackageInfo(pkg);
         }
 
-        // Fix each directory type
+        // Fix directories
         r.dataOk = fixDir(LOWER + "/data/" + pkg, owner, diagnose);
         r.obbOk = fixDir(LOWER + "/obb/" + pkg, owner, diagnose);
         r.mediaOk = fixDir(LOWER + "/media/" + pkg, owner, diagnose);
 
+        // Fix appops (FileProvider + storage access)
+        fixAppops(pkg);
+
         if (diagnose) {
-            // Verify from FUSE side
             FixerLog.i("=== FUSE VERIFICATION ===");
             for (String type : DIR_TYPES) {
                 logDirState("FUSE", FUSE + "/" + type + "/" + pkg);
             }
 
-            // Write tests
             FixerLog.i("=== WRITE TESTS ===");
             for (String type : DIR_TYPES) {
                 boolean lower = testWrite(LOWER + "/" + type + "/" + pkg);
@@ -121,6 +157,19 @@ public class StorageFixer {
                         + " fuse=" + (fuse ? "PASS" : "FAIL"));
             }
             r.writeTestOk = testWrite(FUSE + "/data/" + pkg);
+
+            // Log appops state
+            FixerLog.i("=== APPOPS STATE ===");
+            Shell.Result appops = Shell.cmd(
+                "appops get " + pkg + " LEGACY_STORAGE;"
+                + " appops get " + pkg + " NO_ISOLATED_STORAGE;"
+                + " appops get " + pkg + " MANAGE_EXTERNAL_STORAGE;"
+                + " appops get " + pkg + " READ_EXTERNAL_STORAGE;"
+                + " appops get " + pkg + " WRITE_EXTERNAL_STORAGE"
+            ).exec();
+            for (String line : appops.getOut()) {
+                FixerLog.i("  " + line.trim());
+            }
         }
 
         r.success = r.dataOk && r.obbOk;
@@ -138,33 +187,31 @@ public class StorageFixer {
     private static boolean fixDir(String path, String owner, boolean diagnose) {
         if (diagnose) logDirState("BEFORE", path);
 
-        // Ensure parent exists
         String parent = path.substring(0, path.lastIndexOf('/'));
         Shell.cmd("mkdir -p '" + parent + "'").exec();
 
-        // Create directory
         Shell.Result mk = Shell.cmd("mkdir -p '" + path + "'").exec();
         if (!mk.isSuccess()) {
             if (diagnose) for (String e : mk.getErr()) FixerLog.e("  mkdir ERR: " + e);
             return false;
         }
 
-        // Set ownership to APP UID (NOT media_rw!)
         Shell.cmd("chown " + owner + " '" + path + "'").exec();
-
-        // Set permissions to 777
         Shell.cmd("chmod 777 '" + path + "'").exec();
 
-        // Use restorecon instead of chcon!
-        // This lets Android's sepolicy assign the correct context
-        // with proper MLS categories for the app's UID
-        Shell.Result restorecon = Shell.cmd("restorecon -R '" + path + "'").exec();
-        if (!restorecon.isSuccess() && diagnose) {
-            FixerLog.w("  restorecon failed, falling back to chcon");
-            Shell.cmd("chcon u:object_r:media_rw_data_file:s0 '" + path + "'").exec();
+        Shell.Result chcon = Shell.cmd(
+            "chcon u:object_r:media_rw_data_file:s0 '" + path + "'"
+        ).exec();
+        if (!chcon.isSuccess()) {
+            String[] alts = {"u:object_r:media_data_file:s0", "u:object_r:fuse:s0"};
+            for (String alt : alts) {
+                if (Shell.cmd("chcon " + alt + " '" + path + "'").exec().isSuccess()) {
+                    if (diagnose) FixerLog.i("  chcon OK: " + alt);
+                    break;
+                }
+            }
         }
 
-        // Recursive ownership fix
         Shell.cmd("chown -R " + owner + " '" + path + "' 2>/dev/null").exec();
 
         if (diagnose) logDirState("AFTER", path);
@@ -199,7 +246,8 @@ public class StorageFixer {
         List<ApplicationInfo> apps = pm.getInstalledApplications(
                 PackageManager.ApplicationInfoFlags.of(0));
 
-        int fixed = 0;
+        int fixedDirs = 0;
+        int fixedAppops = 0;
         int skipped = 0;
         List<String> fixedPkgs = new ArrayList<>();
 
@@ -208,17 +256,26 @@ public class StorageFixer {
             String pkg = app.packageName;
             if (pkg.equals(ctx.getPackageName())) continue;
 
-            if (!needsFix(pkg)) {
+            boolean dirsBroken = needsFix(pkg);
+            boolean appopsBroken = needsAppopsFix(pkg);
+
+            if (!dirsBroken && !appopsBroken) {
                 skipped++;
                 continue;
             }
 
-            FixerLog.i("BROKEN: " + pkg + " -> fixing...");
-            FixResult r = fixPackage(ctx, pkg);
-            results.add(r);
-            if (r.success) {
-                fixed++;
-                fixedPkgs.add(pkg);
+            if (dirsBroken) {
+                FixerLog.i("BROKEN dirs: " + pkg + " -> fixing...");
+                FixResult r = fixPackage(ctx, pkg);
+                results.add(r);
+                if (r.success) {
+                    fixedDirs++;
+                    fixedPkgs.add(pkg);
+                }
+            } else if (appopsBroken) {
+                FixerLog.i("BROKEN appops: " + pkg + " -> fixing...");
+                fixAppops(pkg);
+                fixedAppops++;
             }
         }
 
@@ -230,7 +287,9 @@ public class StorageFixer {
             triggerMediaRescan();
         }
 
-        FixerLog.i("Done: " + fixed + " fixed, " + skipped + " already OK");
+        FixerLog.i("Done: " + fixedDirs + " dirs fixed, "
+                + fixedAppops + " appops fixed, "
+                + skipped + " already OK");
         return results;
     }
 
@@ -253,13 +312,11 @@ public class StorageFixer {
         ).exec();
         FixerLog.i("Root: " + join(ksuRes.getOut()));
 
-        // Mount info
         Shell.Result fsRes = Shell.cmd("mount | grep emulated | head -5").exec();
         FixerLog.i("Mounts:");
         for (String line : fsRes.getOut())
             FixerLog.i("  " + line.trim());
 
-        // AVC denials
         Shell.Result avcRes = Shell.cmd(
             "dmesg 2>/dev/null | grep 'avc.*denied' | grep -iE 'vold|media|fuse|"
             + pkg.replace(".", "\\.") + "' | tail -15"
@@ -269,39 +326,30 @@ public class StorageFixer {
         for (String line : avcRes.getOut())
             FixerLog.i("  " + line.trim());
 
-        // App info
         int uid = getAppUid(ctx, pkg);
         FixerLog.i("App UID: " + uid);
+        FixerLog.i("Needs dir fix: " + (needsFix(pkg) ? "YES" : "NO"));
+        FixerLog.i("Needs appops fix: " + (needsAppopsFix(pkg) ? "YES" : "NO"));
 
-        // Needs fix?
-        boolean needs = needsFix(pkg);
-        FixerLog.i("Needs fix: " + (needs ? "YES" : "NO"));
-
-        // Current state
         FixerLog.i("=== CURRENT STATE ===");
         for (String type : DIR_TYPES) {
             logDirState("LOWER", LOWER + "/" + type + "/" + pkg);
             logDirState("FUSE", FUSE + "/" + type + "/" + pkg);
         }
 
-        // Apply fix
         FixerLog.i("=== APPLYING FIX ===");
         fixPackage(ctx, pkg, true);
 
-        // Force stop
         forceStopPackage(pkg);
 
-        // Wait
         try { Thread.sleep(3000); } catch (InterruptedException ignored) {}
 
-        // Final state
         FixerLog.i("=== POST-FIX (3s after force-stop) ===");
         for (String type : DIR_TYPES) {
             logDirState("LOWER-FINAL", LOWER + "/" + type + "/" + pkg);
             logDirState("FUSE-FINAL", FUSE + "/" + type + "/" + pkg);
         }
 
-        // Final write tests
         FixerLog.i("=== FINAL WRITE TESTS ===");
         for (String type : DIR_TYPES) {
             boolean lower = testWrite(LOWER + "/" + type + "/" + pkg);
@@ -342,12 +390,10 @@ public class StorageFixer {
         ).exec();
         String status = exists.getOut().isEmpty() ? "UNKNOWN"
                 : exists.getOut().get(0);
-
         if ("MISSING".equals(status)) {
             FixerLog.d("  [" + label + "] " + path + " -> MISSING");
             return;
         }
-
         Shell.Result ls = Shell.cmd("ls -laZd '" + path + "'").exec();
         String info = ls.getOut().isEmpty() ? "?" : ls.getOut().get(0).trim();
         FixerLog.d("  [" + label + "] " + info);

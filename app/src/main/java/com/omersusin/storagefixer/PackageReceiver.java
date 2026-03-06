@@ -23,16 +23,22 @@ public class PackageReceiver extends BroadcastReceiver {
                 FixerLog.i("Waiting 10s for vold...");
                 Thread.sleep(10000);
 
-                if (!StorageFixer.needsFix(pkg)) {
-                    FixerLog.i(pkg + " dirs OK, skipping");
-                    return;
+                // Fix directories if needed
+                if (StorageFixer.needsFix(pkg)) {
+                    FixerLog.i("Fixing dirs for " + pkg);
+                    StorageFixer.fixPackage(context, pkg);
                 }
 
-                FixerLog.i("Fixing " + pkg + "...");
-                StorageFixer.FixResult r = StorageFixer.fixPackage(context, pkg);
+                // Always fix appops for new installs
+                StorageFixer.fixAppops(pkg);
+
+                // Force stop so app picks up new permissions
                 StorageFixer.forceStopPackage(pkg);
+
+                // Rescan
                 StorageFixer.triggerMediaRescan();
-                FixerLog.i("Auto-fix done: " + r);
+
+                FixerLog.i("Auto-fix complete for " + pkg);
 
             } catch (InterruptedException ignored) {
             } finally {
