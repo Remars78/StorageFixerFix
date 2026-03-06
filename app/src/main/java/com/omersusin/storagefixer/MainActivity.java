@@ -35,7 +35,6 @@ public class MainActivity extends AppCompatActivity {
         Button btnCopy = findViewById(R.id.btnCopyLog);
         Button btnClear = findViewById(R.id.btnClearLog);
 
-        // Notification permission (API 33+)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
                     != PackageManager.PERMISSION_GRANTED) {
@@ -45,11 +44,11 @@ public class MainActivity extends AppCompatActivity {
         }
 
         btnFix.setOnClickListener(v -> {
-            statusView.setText("⏳ Fixing all apps...");
+            statusView.setText("Fixing all apps...");
             Intent svc = new Intent(this, FixerService.class);
             svc.setAction("MANUAL_SCAN");
             startForegroundService(svc);
-            v.postDelayed(this::refreshLog, 5000);
+            v.postDelayed(this::refreshLog, 8000);
         });
 
         btnDiagnose.setOnClickListener(v -> showDiagnoseDialog());
@@ -58,9 +57,9 @@ public class MainActivity extends AppCompatActivity {
 
         btnCopy.setOnClickListener(v -> {
             if (FixerLog.copyToClipboard(this)) {
-                Toast.makeText(this, "📋 Logs copied!", Toast.LENGTH_SHORT).show();
+                Toast.makeText(this, "Logs copied!", Toast.LENGTH_SHORT).show();
             } else {
-                Toast.makeText(this, "❌ Copy failed", Toast.LENGTH_SHORT).show();
+                Toast.makeText(this, "Copy failed", Toast.LENGTH_SHORT).show();
             }
         });
 
@@ -80,28 +79,28 @@ public class MainActivity extends AppCompatActivity {
         input.setPadding(48, 32, 48, 32);
 
         new AlertDialog.Builder(this)
-                .setTitle("🔍 Diagnose Package")
-                .setMessage("Enter the package name to diagnose.\n\nThis will run a full diagnostic with detailed logs.")
+                .setTitle("Diagnose Package")
+                .setMessage("Enter package name for full diagnosis.\nFixes with app UID, force stops, and rescans.")
                 .setView(input)
                 .setPositiveButton("Diagnose", (d, w) -> {
                     String pkg = input.getText().toString().trim();
                     if (pkg.isEmpty()) return;
-                    statusView.setText("🔍 Diagnosing " + pkg + "...");
+                    statusView.setText("Diagnosing " + pkg + "...");
                     new Thread(() -> {
                         StorageFixer.diagnosePackage(this, pkg);
                         runOnUiThread(() -> {
-                            statusView.setText("✅ Diagnosis complete for " + pkg);
+                            statusView.setText("Diagnosis complete: " + pkg);
                             refreshLog();
                         });
                     }).start();
                 })
                 .setNeutralButton("Telegram", (d, w) -> {
-                    statusView.setText("🔍 Diagnosing Telegram...");
+                    statusView.setText("Diagnosing Telegram...");
                     new Thread(() -> {
                         StorageFixer.diagnosePackage(this,
                                 "org.telegram.messenger");
                         runOnUiThread(() -> {
-                            statusView.setText("✅ Telegram diagnosis complete");
+                            statusView.setText("Telegram diagnosis complete");
                             refreshLog();
                         });
                     }).start();
@@ -120,8 +119,8 @@ public class MainActivity extends AppCompatActivity {
         new Thread(() -> {
             boolean root = StorageFixer.isRootAvailable();
             boolean fuse = StorageFixer.isFuseReady();
-            String s = "Root: " + (root ? "✅" : "❌")
-                    + "   Storage: " + (fuse ? "✅" : "❌")
+            String s = "Root: " + (root ? "YES" : "NO")
+                    + "   Storage: " + (fuse ? "YES" : "NO")
                     + "\nAPI: " + Build.VERSION.SDK_INT
                     + "   Android: " + Build.VERSION.RELEASE;
             runOnUiThread(() -> statusView.setText(s));
@@ -134,8 +133,10 @@ public class MainActivity extends AppCompatActivity {
         if (logs.isEmpty()) {
             sb.append("No logs yet.\n\n");
             sb.append("Auto-fix runs on:\n");
-            sb.append("• Boot completed\n");
-            sb.append("• App install / update\n\n");
+            sb.append("  Boot (with 5s vold delay)\n");
+            sb.append("  App install/update (with 5s delay)\n\n");
+            sb.append("Uses app UID for ownership (not media_rw)\n");
+            sb.append("Force stops apps after fix\n\n");
             sb.append("Tap 'Fix All' for manual scan.\n");
             sb.append("Tap 'Diagnose' for detailed analysis.");
         } else {

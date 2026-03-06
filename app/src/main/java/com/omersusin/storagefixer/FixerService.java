@@ -31,24 +31,28 @@ public class FixerService extends Service {
         new Thread(() -> {
             try {
                 if (!StorageFixer.isRootAvailable()) {
-                    FixerLog.e("❌ Root not available");
-                    updateNotif("❌ No root");
+                    FixerLog.e("Root not available");
+                    updateNotif("No root");
                     return;
                 }
 
-                updateNotif("⏳ Waiting for storage...");
+                updateNotif("Waiting for storage...");
                 if (!StorageFixer.waitForFuse(60)) {
-                    updateNotif("❌ Storage timeout");
+                    updateNotif("Storage timeout");
                     return;
                 }
 
-                updateNotif("🔍 Scanning...");
+                // Wait extra 5s on boot for vold to finish
+                FixerLog.i("Waiting 5s for vold to settle after boot...");
+                Thread.sleep(5000);
+
+                updateNotif("Scanning...");
                 List<StorageFixer.FixResult> results =
                         StorageFixer.fixAll(this);
 
                 long ok = results.stream()
                         .filter(r -> r.success).count();
-                String msg = "✅ " + ok + "/" + results.size() + " fixed";
+                String msg = ok + "/" + results.size() + " fixed";
                 updateNotif(msg);
 
                 Thread.sleep(3000);

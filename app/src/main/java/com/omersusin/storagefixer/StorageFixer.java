@@ -13,7 +13,6 @@ public class StorageFixer {
 
     private static final String LOWER = "/data/media/0/Android";
     private static final String FUSE = "/storage/emulated/0/Android";
-    private static final String OWNER = "media_rw:media_rw";
     private static final String SECTX = "u:object_r:media_rw_data_file:s0";
     private static final String DIR_PERM = "777";
     private static final String FILE_PERM = "666";
@@ -45,14 +44,27 @@ public class StorageFixer {
         return false;
     }
 
+    // ========== GET APP UID ==========
+
+    private static int getAppUid(Context ctx, String pkg) {
+        try {
+            ApplicationInfo info = ctx.getPackageManager()
+                    .getApplicationInfo(pkg, PackageManager.ApplicationInfoFlags.of(0));
+            return info.uid;
+        } catch (PackageManager.NameNotFoundException e) {
+            FixerLog.e("Package not found: " + pkg);
+            return -1;
+        }
+    }
+
     // ========== CHECK IF APP NEEDS FIXING ==========
 
-    private static boolean needsFix(String pkg) {
+    public static boolean needsFix(String pkg) {
         for (String type : DIR_TYPES) {
             String lowerPath = LOWER + "/" + type + "/" + pkg;
             String fusePath = FUSE + "/" + type + "/" + pkg;
 
-            // Check if directory exists on lower FS
+            // Check lower FS existence
             Shell.Result exists = Shell.cmd(
                 "[ -d '" + lowerPath + "' ] && echo Y || echo N"
             ).exec();
@@ -61,16 +73,13 @@ public class StorageFixer {
                 return true;
             }
 
-            // Check ownership
-            Shell.Result owner = Shell.cmd(
-                "stat -c '%U:%G' '" + lowerPath + "' 2>/dev/null"
+            // Check FUSE visibility
+            Shell.Result fuseExists = Shell.cmd(
+                "[ -d '" + fusePath + "' ] && echo Y || echo N"
             ).exec();
-            if (!owner.getOut().isEmpty()) {
-                String o = owner.getOut().get(0).trim();
-                if (!o.equals("media_rw:media_rw")) {
-                    FixerLog.d("  Needs fix: " + lowerPath + " owner=" + o);
-                    return true;
-                }
+            if (fuseExists.getOut().isEmpty() || "N".equals(fuseExists.getOut().get(0))) {
+                FixerLog.d("  Needs fix: " + fusePath + " not visible on FUSE");
+                return true;
             }
 
             // Check permissions
@@ -85,12 +94,13 @@ public class StorageFixer {
                 }
             }
 
-            // Check FUSE visibility
-            Shell.Result fuseExists = Shell.cmd(
-                "[ -d '" + fusePath + "' ] && echo Y || echo N"
+            // Write test on FUSE path (the real test)
+            String testFile = fusePath + "/.sf_test_" + System.currentTimeMillis();
+            Shell.Result writeTest = Shell.cmd(
+                "echo t > '" + testFile + "' 2>/dev/null && rm '" + testFile + "' 2>/dev/null && echo Y || echo N"
             ).exec();
-            if (fuseExists.getOut().isEmpty() || "N".equals(fuseExists.getOut().get(0))) {
-                FixerLog.d("  Needs fix: " + fusePath + " not visible on FUSE");
+            if (writeTest.getOut().isEmpty() || "N".equals(writeTest.getOut().get(0))) {
+                FixerLog.d("  Needs fix: " + fusePath + " write test FAILED");
                 return true;
             }
         }
@@ -99,42 +109,50 @@ public class StorageFixer {
 
     // ========== FIX PACKAGE ==========
 
-    public static FixResult fixPackage(String pkg) {
-        return fixPackage(pkg, false);
+    public static FixResult fixPackage(Context ctx, String pkg) {
+        return fixPackage(ctx, pkg, false);
     }
 
-    public static FixResult fixPackage(String pkg, boolean diagnose) {
+    public static FixResult fixPackage(Context ctx, String pkg, boolean diagnose) {
         FixResult r = new FixResult(pkg);
+
+        int uid = getAppUid(ctx, pkg);
+        if (uid < 0) {
+            FixerLog.e("Cannot get UID for " + pkg + ", using media_rw fallback");
+        }
+        String owner = (uid > 0) ? (uid + ":" + uid) : "media_rw:media_rw";
 
         if (diagnose) {
             FixerLog.divider();
             FixerLog.i("DIAGNOSING: " + pkg);
+            FixerLog.i("App UID: " + uid + " -> owner=" + owner);
             logPackageInfo(pkg);
             logParentDirs();
         }
 
-        // Fix each type on BOTH lower FS and FUSE
-        r.dataOk = fixBothPaths("data", pkg, diagnose);
-        r.obbOk = fixBothPaths("obb", pkg, diagnose);
-        r.mediaOk = fixBothPaths("media", pkg, diagnose);
+        // Fix on LOWER filesystem with APP UID
+        r.dataOk = fixDir(LOWER + "/data/" + pkg, owner, diagnose);
+        r.obbOk = fixDir(LOWER + "/obb/" + pkg, owner, diagnose);
+        r.mediaOk = fixDir(LOWER + "/media/" + pkg, owner, diagnose);
 
-        // Create common subdirs for data and media
-        fixSubDirs(LOWER + "/data/" + pkg, diagnose);
-        fixSubDirs(LOWER + "/media/" + pkg, diagnose);
-        fixSubDirs(FUSE + "/data/" + pkg, diagnose);
-        fixSubDirs(FUSE + "/media/" + pkg, diagnose);
+        // Also fix on FUSE path with APP UID
+        fixDir(FUSE + "/data/" + pkg, owner, false);
+        fixDir(FUSE + "/obb/" + pkg, owner, false);
+        fixDir(FUSE + "/media/" + pkg, owner, false);
 
-        // Verify write tests
+        // Create common subdirs
+        for (String base : new String[]{LOWER, FUSE}) {
+            fixSubDirs(base + "/data/" + pkg, owner, diagnose);
+            fixSubDirs(base + "/media/" + pkg, owner, diagnose);
+        }
+
         if (diagnose) {
             FixerLog.i("=== WRITE TESTS ===");
-            r.writeTestOk = testWrite(LOWER + "/data/" + pkg);
-            FixerLog.i("  Lower data write: " + (r.writeTestOk ? "PASS" : "FAIL"));
-            boolean fuseWrite = testWrite(FUSE + "/data/" + pkg);
-            FixerLog.i("  FUSE data write: " + (fuseWrite ? "PASS" : "FAIL"));
-            boolean lowerMedia = testWrite(LOWER + "/media/" + pkg);
-            FixerLog.i("  Lower media write: " + (lowerMedia ? "PASS" : "FAIL"));
-            boolean fuseMedia = testWrite(FUSE + "/media/" + pkg);
-            FixerLog.i("  FUSE media write: " + (fuseMedia ? "PASS" : "FAIL"));
+            r.writeTestOk = testWrite(FUSE + "/data/" + pkg);
+            FixerLog.i("  FUSE data: " + (r.writeTestOk ? "PASS" : "FAIL"));
+            FixerLog.i("  FUSE obb: " + (testWrite(FUSE + "/obb/" + pkg) ? "PASS" : "FAIL"));
+            FixerLog.i("  FUSE media: " + (testWrite(FUSE + "/media/" + pkg) ? "PASS" : "FAIL"));
+            FixerLog.i("  Lower data: " + (testWrite(LOWER + "/data/" + pkg) ? "PASS" : "FAIL"));
         }
 
         r.success = r.dataOk && r.obbOk;
@@ -142,39 +160,19 @@ public class StorageFixer {
         FixerLog.i((r.success ? "OK" : "FAIL") + " " + pkg
                 + " [data:" + (r.dataOk ? "ok" : "fail")
                 + " obb:" + (r.obbOk ? "ok" : "fail")
-                + " media:" + (r.mediaOk ? "ok" : "fail") + "]");
+                + " media:" + (r.mediaOk ? "ok" : "fail")
+                + " uid:" + uid + "]");
 
         if (diagnose) FixerLog.divider();
         return r;
     }
 
-    private static boolean fixBothPaths(String type, String pkg, boolean diagnose) {
-        String lowerPath = LOWER + "/" + type + "/" + pkg;
-        String fusePath = FUSE + "/" + type + "/" + pkg;
-
-        if (diagnose) {
-            logDirState("LOWER-BEFORE", lowerPath);
-            logDirState("FUSE-BEFORE", fusePath);
-        }
-
-        // Fix on lower filesystem first
-        boolean lowerOk = fixSingleDir(lowerPath, diagnose);
-
-        // Also fix on FUSE path (some ROMs need both)
-        boolean fuseOk = fixSingleDir(fusePath, diagnose);
-
-        if (diagnose) {
-            logDirState("LOWER-AFTER", lowerPath);
-            logDirState("FUSE-AFTER", fusePath);
-        }
-
-        return lowerOk || fuseOk;
-    }
-
-    private static boolean fixSingleDir(String path, boolean diagnose) {
+    private static boolean fixDir(String path, String owner, boolean diagnose) {
         String parentPath = path.substring(0, path.lastIndexOf('/'));
 
-        // Ensure parent exists
+        if (diagnose) logDirState("BEFORE", path);
+
+        // Ensure parent
         Shell.cmd("mkdir -p '" + parentPath + "'").exec();
 
         // Create directory
@@ -184,37 +182,40 @@ public class StorageFixer {
             return false;
         }
 
-        // Set ownership FIRST
-        Shell.cmd("chown " + OWNER + " '" + path + "'").exec();
+        // Set ownership to APP UID (not media_rw!)
+        Shell.Result chownRes = Shell.cmd("chown " + owner + " '" + path + "'").exec();
+        if (!chownRes.isSuccess() && diagnose) {
+            for (String e : chownRes.getErr()) FixerLog.e("  chown ERR: " + e);
+        }
 
-        // Set permissions to 777 (matching manual fix)
+        // Set permissions
         Shell.cmd("chmod " + DIR_PERM + " '" + path + "'").exec();
 
         // Set SELinux context
         Shell.Result chconRes = Shell.cmd("chcon '" + SECTX + "' '" + path + "'").exec();
         if (!chconRes.isSuccess()) {
-            // Try alternatives
             String[] alts = {
                 "u:object_r:media_rw_data_file:s0",
                 "u:object_r:media_data_file:s0",
-                "u:object_r:sdcardfs:s0",
                 "u:object_r:fuse:s0",
             };
             for (String alt : alts) {
                 if (Shell.cmd("chcon '" + alt + "' '" + path + "'").exec().isSuccess()) {
-                    if (diagnose) FixerLog.i("  chcon OK with: " + alt);
+                    if (diagnose) FixerLog.i("  chcon OK: " + alt);
                     break;
                 }
             }
         }
 
-        // Recursive fix for existing contents
+        // Recursive
         Shell.cmd(String.join("; ",
             "find '" + path + "' -type d -exec chmod " + DIR_PERM + " {} + 2>/dev/null",
             "find '" + path + "' -type f -exec chmod " + FILE_PERM + " {} + 2>/dev/null",
-            "chown -R " + OWNER + " '" + path + "' 2>/dev/null",
+            "chown -R " + owner + " '" + path + "' 2>/dev/null",
             "chcon -R '" + SECTX + "' '" + path + "' 2>/dev/null"
         )).exec();
+
+        if (diagnose) logDirState("AFTER", path);
 
         Shell.Result verify = Shell.cmd(
             "[ -d '" + path + "' ] && echo OK || echo FAIL"
@@ -222,12 +223,12 @@ public class StorageFixer {
         return !verify.getOut().isEmpty() && "OK".equals(verify.getOut().get(0));
     }
 
-    private static void fixSubDirs(String parentPath, boolean diagnose) {
+    private static void fixSubDirs(String parentPath, String owner, boolean diagnose) {
         for (String sub : SUBDIRS) {
             String subPath = parentPath + "/" + sub;
             Shell.cmd(String.join(" && ",
                 "mkdir -p '" + subPath + "'",
-                "chown " + OWNER + " '" + subPath + "'",
+                "chown " + owner + " '" + subPath + "'",
                 "chmod " + DIR_PERM + " '" + subPath + "'",
                 "chcon " + SECTX + " '" + subPath + "' 2>/dev/null")
             ).exec();
@@ -246,17 +247,13 @@ public class StorageFixer {
 
     public static void triggerMediaRescan(String pkg) {
         Shell.cmd(
-            "am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE"
-            + " -d 'file:///storage/emulated/0/Android/data/" + pkg + "'"
-        ).exec();
-        Shell.cmd(
             "content call --uri content://media/"
             + " --method scan_volume --arg external_primary"
         ).exec();
-        FixerLog.i("Media rescan triggered for " + pkg);
+        FixerLog.i("Media rescan triggered");
     }
 
-    // ========== FIX ALL (only broken) ==========
+    // ========== FIX ALL ==========
 
     public static List<FixResult> fixAll(Context ctx) {
         List<FixResult> results = new ArrayList<>();
@@ -266,41 +263,37 @@ public class StorageFixer {
 
         int fixed = 0;
         int skipped = 0;
-        List<String> fixedPackages = new ArrayList<>();
+        List<String> fixedPkgs = new ArrayList<>();
 
         for (ApplicationInfo app : apps) {
             if ((app.flags & ApplicationInfo.FLAG_SYSTEM) != 0) continue;
             String pkg = app.packageName;
-
-            // Skip our own app
             if (pkg.equals(ctx.getPackageName())) continue;
 
-            // Check if fix is needed
             if (!needsFix(pkg)) {
                 skipped++;
                 continue;
             }
 
             FixerLog.i("Fixing: " + pkg);
-            FixResult r = fixPackage(pkg);
+            FixResult r = fixPackage(ctx, pkg);
             results.add(r);
             if (r.success) {
                 fixed++;
-                fixedPackages.add(pkg);
+                fixedPkgs.add(pkg);
             }
         }
 
         // Force stop all fixed apps
-        for (String pkg : fixedPackages) {
+        for (String pkg : fixedPkgs) {
             forceStopPackage(pkg);
         }
 
-        // Trigger media rescan once
-        if (!fixedPackages.isEmpty()) {
+        if (!fixedPkgs.isEmpty()) {
             triggerMediaRescan("all");
         }
 
-        FixerLog.i("Done: " + fixed + " fixed, " + skipped + " skipped (already OK)");
+        FixerLog.i("Done: " + fixed + " fixed, " + skipped + " already OK");
         return results;
     }
 
@@ -310,23 +303,19 @@ public class StorageFixer {
         FixerLog.divider();
         FixerLog.i("=== FULL DIAGNOSIS: " + pkg + " ===");
 
-        // System info
         Shell.Result sdkRes = Shell.cmd("getprop ro.build.version.sdk").exec();
         Shell.Result romRes = Shell.cmd("getprop ro.build.display.id").exec();
         FixerLog.i("SDK: " + join(sdkRes.getOut()));
         FixerLog.i("ROM: " + join(romRes.getOut()));
 
-        // SELinux
         Shell.Result seRes = Shell.cmd("getenforce").exec();
         FixerLog.i("SELinux: " + join(seRes.getOut()));
 
-        // Mount info
         Shell.Result fsRes = Shell.cmd("mount | grep emulated | head -5").exec();
-        FixerLog.i("Storage mounts:");
+        FixerLog.i("Mounts:");
         for (String line : fsRes.getOut())
             FixerLog.i("  " + line.trim());
 
-        // Root method
         Shell.Result magiskRes = Shell.cmd("magisk -v 2>/dev/null").exec();
         Shell.Result ksuRes = Shell.cmd(
             "ksud --version 2>/dev/null; ksu --version 2>/dev/null").exec();
@@ -335,19 +324,19 @@ public class StorageFixer {
 
         // AVC denials
         Shell.Result avcRes = Shell.cmd(
-            "dmesg | grep 'avc.*denied' | tail -20 2>/dev/null"
+            "dmesg | grep 'avc.*denied' | grep -i 'vold\\|media\\|fuse\\|sdcard' | tail -15 2>/dev/null"
             + " || echo 'Cannot read dmesg'"
         ).exec();
-        FixerLog.i("Recent AVC denials:");
+        FixerLog.i("Storage AVC denials:");
         for (String line : avcRes.getOut())
             FixerLog.i("  " + line.trim());
 
-        // Check needs fix
+        // Needs fix check
         boolean needs = needsFix(pkg);
         FixerLog.i("Needs fix: " + (needs ? "YES" : "NO"));
 
-        // Fix with diagnostics
-        fixPackage(pkg, true);
+        // Fix with diag (this uses app UID)
+        fixPackage(ctx, pkg, true);
 
         // Force stop
         forceStopPackage(pkg);
@@ -355,19 +344,18 @@ public class StorageFixer {
         // Rescan
         triggerMediaRescan(pkg);
 
-        // Wait for FUSE to update
+        // Wait for FUSE to settle
         try { Thread.sleep(3000); } catch (InterruptedException ignored) {}
 
         // Final verification
-        FixerLog.i("=== FINAL VERIFICATION (3s after fix + force-stop) ===");
+        FixerLog.i("=== FINAL VERIFICATION ===");
         for (String type : DIR_TYPES) {
             logDirState("LOWER-FINAL", LOWER + "/" + type + "/" + pkg);
             logDirState("FUSE-FINAL", FUSE + "/" + type + "/" + pkg);
         }
 
-        // Write test from FUSE
         boolean fuseWrite = testWrite(FUSE + "/data/" + pkg);
-        FixerLog.i("FUSE write test after fix: " + (fuseWrite ? "PASS" : "FAIL"));
+        FixerLog.i("FUSE write after fix+force-stop: " + (fuseWrite ? "PASS" : "FAIL"));
 
         FixerLog.divider();
     }
@@ -375,7 +363,7 @@ public class StorageFixer {
     // ========== HELPERS ==========
 
     private static boolean testWrite(String path) {
-        String testFile = path + "/.storagefixer_test";
+        String testFile = path + "/.sf_test";
         Shell.Result w = Shell.cmd(
             "echo test > '" + testFile + "' && cat '" + testFile
             + "' && rm '" + testFile + "'"
@@ -387,7 +375,7 @@ public class StorageFixer {
         Shell.Result uidRes = Shell.cmd(
             "dumpsys package " + pkg + " | grep userId= | head -1").exec();
         for (String line : uidRes.getOut())
-            FixerLog.d("  UID: " + line.trim());
+            FixerLog.d("  " + line.trim());
 
         Shell.Result permRes = Shell.cmd(
             "dumpsys package " + pkg
@@ -427,14 +415,6 @@ public class StorageFixer {
         Shell.Result lsRes = Shell.cmd("ls -laZd '" + path + "'").exec();
         for (String line : lsRes.getOut())
             FixerLog.d("    " + line.trim());
-
-        Shell.Result subRes = Shell.cmd(
-            "ls -laZ '" + path + "/' 2>/dev/null | head -10").exec();
-        if (!subRes.getOut().isEmpty()) {
-            FixerLog.d("    Contents:");
-            for (String line : subRes.getOut())
-                FixerLog.d("      " + line.trim());
-        }
     }
 
     private static String join(List<String> list) {
