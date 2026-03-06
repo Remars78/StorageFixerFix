@@ -14,35 +14,33 @@ public class PackageReceiver extends BroadcastReceiver {
         if (pkg == null) return;
         if (pkg.equals(context.getPackageName())) return;
 
-        String action = intent.getAction();
-        FixerLog.i("Package event: " + action + " -> " + pkg);
+        FixerLog.i("Package event: " + intent.getAction() + " -> " + pkg);
 
         PendingResult pending = goAsync();
         new Thread(() -> {
             try {
-                // CRITICAL: Wait 5s for vold to fail and settle.
-                // If we fix too early, vold will overwrite our fix.
-                FixerLog.i("Waiting 5s for vold to settle...");
-                Thread.sleep(5000);
+                // Wait 10s for vold to try AND FAIL completely
+                // This is critical - we must fix AFTER vold gives up
+                FixerLog.i("Waiting 10s for vold to settle...");
+                Thread.sleep(10000);
 
-                // Pass 1: fix with app UID
-                FixerLog.i("Pass 1 for " + pkg);
-                StorageFixer.fixPackage(context, pkg);
+                // Check if fix is needed
+                if (!StorageFixer.needsFix(pkg)) {
+                    FixerLog.i("  " + pkg + " dirs OK, skipping");
+                    return;
+                }
 
-                // Wait 3s for app to create its own subdirs
-                Thread.sleep(3000);
+                // Fix (matching manual fix exactly)
+                FixerLog.i("Fixing " + pkg + "...");
+                StorageFixer.FixResult r = StorageFixer.fixPackage(pkg);
 
-                // Pass 2: fix any new subdirs
-                FixerLog.i("Pass 2 for " + pkg);
-                StorageFixer.FixResult r = StorageFixer.fixPackage(context, pkg);
-
-                // Force stop so app picks up new permissions
+                // Force stop so app gets fresh FUSE mount on next launch
                 StorageFixer.forceStopPackage(pkg);
 
-                // Trigger media rescan
-                StorageFixer.triggerMediaRescan(pkg);
+                // Rescan
+                StorageFixer.triggerMediaRescan();
 
-                FixerLog.i("Auto-fix complete: " + r);
+                FixerLog.i("Auto-fix done: " + r);
 
             } catch (InterruptedException ignored) {
             } finally {
