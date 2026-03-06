@@ -11,21 +11,19 @@ import java.util.List;
 
 public class StorageFixer {
 
-    private static final String BASE = "/storage/emulated/0/Android";
+    // Lower filesystem path - bypasses FUSE entirely
+    private static final String LOWER = "/data/media/0/Android";
+    // FUSE path - only used for verification
+    private static final String FUSE = "/storage/emulated/0/Android";
+
     private static final String OWNER = "media_rw:media_rw";
-    private static final String DIR_PERM = "777";
-    private static final String FILE_PERM = "666";
+    private static final String SECTX = "u:object_r:media_rw_data_file:s0";
+    private static final String DIR_PERM = "2771";
+    private static final String FILE_PERM = "660";
 
     private static final String[] SUBDIRS = {
         "cache", "files", "no_backup", "shared_prefs",
         "databases", "code_cache"
-    };
-
-    // Different dirs may need different SELinux contexts
-    private static final String[][] DIR_CONFIGS = {
-        {"data",  "u:object_r:media_rw_data_file:s0"},
-        {"obb",   "u:object_r:media_rw_data_file:s0"},
-        {"media", "u:object_r:media_rw_data_file:s0"},
     };
 
     public static boolean isRootAvailable() {
@@ -33,7 +31,7 @@ public class StorageFixer {
     }
 
     public static boolean isFuseReady() {
-        return Shell.cmd("ls " + BASE + "/").exec().isSuccess();
+        return Shell.cmd("ls " + FUSE + "/").exec().isSuccess();
     }
 
     public static boolean waitForFuse(int maxSeconds) {
@@ -59,44 +57,43 @@ public class StorageFixer {
             FixerLog.divider();
             FixerLog.i("DIAGNOSING: " + pkg);
             logPackageInfo(pkg);
-            // Log parent dir contexts first
-            logParentDirs(diagnose);
+            logParentDirs();
         }
 
-        // Fix Android/data/<pkg>
-        String dataPath = BASE + "/data/" + pkg;
+        // Fix on LOWER filesystem (bypasses FUSE)
+        String dataPath = LOWER + "/data/" + pkg;
         if (diagnose) logDirState("BEFORE", dataPath);
-        r.dataOk = fixDirSmart(dataPath, "data", diagnose);
+        r.dataOk = fixDir(dataPath, diagnose);
         fixSubDirs(dataPath, diagnose);
         if (diagnose) logDirState("AFTER", dataPath);
 
-        // Fix Android/obb/<pkg>
-        String obbPath = BASE + "/obb/" + pkg;
+        String obbPath = LOWER + "/obb/" + pkg;
         if (diagnose) logDirState("BEFORE", obbPath);
-        r.obbOk = fixDirSmart(obbPath, "obb", diagnose);
+        r.obbOk = fixDir(obbPath, diagnose);
         if (diagnose) logDirState("AFTER", obbPath);
 
-        // Fix Android/media/<pkg>
-        String mediaPath = BASE + "/media/" + pkg;
+        String mediaPath = LOWER + "/media/" + pkg;
         if (diagnose) logDirState("BEFORE", mediaPath);
-        r.mediaOk = fixDirSmart(mediaPath, "media", diagnose);
+        r.mediaOk = fixDir(mediaPath, diagnose);
         fixSubDirs(mediaPath, diagnose);
         if (diagnose) logDirState("AFTER", mediaPath);
 
-        // Write tests
+        // Verify from FUSE side too
         if (diagnose) {
+            FixerLog.i("=== FUSE VERIFICATION ===");
+            logDirState("FUSE", FUSE + "/data/" + pkg);
+            logDirState("FUSE", FUSE + "/obb/" + pkg);
+            logDirState("FUSE", FUSE + "/media/" + pkg);
+
             r.writeTestOk = testWrite(dataPath);
-            FixerLog.i("Write test data: " + (r.writeTestOk ? "PASS" : "FAIL"));
-            boolean obbWrite = testWrite(obbPath);
-            FixerLog.i("Write test obb: " + (obbWrite ? "PASS" : "FAIL"));
-            boolean mediaWrite = testWrite(mediaPath);
-            FixerLog.i("Write test media: " + (mediaWrite ? "PASS" : "FAIL"));
+            FixerLog.i("Write test lower: " + (r.writeTestOk ? "PASS" : "FAIL"));
+            boolean fuseWrite = testWrite(FUSE + "/data/" + pkg);
+            FixerLog.i("Write test FUSE: " + (fuseWrite ? "PASS" : "FAIL"));
         }
 
-        // Success = data AND obb must work. Media is bonus.
         r.success = r.dataOk && r.obbOk;
 
-        String status = (r.success ? "V" : "X") + " " + pkg
+        String status = (r.success ? "OK" : "FAIL") + " " + pkg
                 + " [data:" + (r.dataOk ? "ok" : "fail")
                 + " obb:" + (r.obbOk ? "ok" : "fail")
                 + " media:" + (r.mediaOk ? "ok" : "fail") + "]";
@@ -106,87 +103,52 @@ public class StorageFixer {
         return r;
     }
 
-    private static void logParentDirs(boolean diagnose) {
-        if (!diagnose) return;
-        String[] parents = {
-            BASE + "/data", BASE + "/obb", BASE + "/media"
-        };
-        for (String p : parents) {
-            Shell.Result res = Shell.cmd(
-                "ls -laZd '" + p + "' 2>/dev/null || echo 'MISSING: " + p + "'"
-            ).exec();
-            for (String line : res.getOut()) {
-                FixerLog.d("  Parent: " + line.trim());
-            }
-        }
-    }
-
-    private static boolean fixDirSmart(String path, String type, boolean diagnose) {
-        // First detect the correct SELinux context from parent
+    private static boolean fixDir(String path, boolean diagnose) {
+        // Detect correct SELinux context from parent
         String parentPath = path.substring(0, path.lastIndexOf('/'));
         String detectedCtx = detectContext(parentPath);
+        String ctx = (detectedCtx != null) ? detectedCtx : SECTX;
 
-        if (diagnose) {
-            FixerLog.d("  Detected parent context: " + detectedCtx);
-        }
+        if (diagnose) FixerLog.d("  Parent context: " + ctx);
 
-        // Ensure parent exists first
-        Shell.Result parentCheck = Shell.cmd(
-            "[ -d '" + parentPath + "' ] && echo EXISTS || echo MISSING"
-        ).exec();
-        String parentStatus = parentCheck.getOut().isEmpty() ? "UNKNOWN"
-                : parentCheck.getOut().get(0);
+        // Ensure parent exists
+        Shell.cmd("mkdir -p '" + parentPath + "'").exec();
 
-        if ("MISSING".equals(parentStatus)) {
-            if (diagnose) FixerLog.w("  Parent missing: " + parentPath + ", creating...");
-            Shell.cmd("mkdir -p '" + parentPath + "'").exec();
-        }
-
-        // Create directory
-        Shell.Result mkResult = Shell.cmd("mkdir -p '" + path + "'").exec();
-        if (!mkResult.isSuccess()) {
-            if (diagnose) {
-                for (String e : mkResult.getErr()) FixerLog.e("  mkdir ERR: " + e);
-            }
+        // Create and set permissions on lower filesystem
+        Shell.Result mkRes = Shell.cmd("mkdir -p '" + path + "'").exec();
+        if (!mkRes.isSuccess()) {
+            if (diagnose) for (String e : mkRes.getErr()) FixerLog.e("  mkdir ERR: " + e);
             return false;
         }
 
-        // chmod
-        Shell.Result chmodResult = Shell.cmd("chmod " + DIR_PERM + " '" + path + "'").exec();
-        if (!chmodResult.isSuccess() && diagnose) {
-            for (String e : chmodResult.getErr()) FixerLog.e("  chmod ERR: " + e);
+        // Set ownership first (important for new dirs)
+        Shell.Result chownRes = Shell.cmd("chown " + OWNER + " '" + path + "'").exec();
+        if (!chownRes.isSuccess() && diagnose) {
+            for (String e : chownRes.getErr()) FixerLog.e("  chown ERR: " + e);
         }
 
-        // chown
-        Shell.Result chownResult = Shell.cmd("chown " + OWNER + " '" + path + "'").exec();
-        if (!chownResult.isSuccess() && diagnose) {
-            for (String e : chownResult.getErr()) FixerLog.e("  chown ERR: " + e);
+        // Set permissions
+        Shell.Result chmodRes = Shell.cmd("chmod " + DIR_PERM + " '" + path + "'").exec();
+        if (!chmodRes.isSuccess() && diagnose) {
+            for (String e : chmodRes.getErr()) FixerLog.e("  chmod ERR: " + e);
         }
 
-        // chcon - use detected context, fallback to default
-        String ctx = (detectedCtx != null && !detectedCtx.isEmpty())
-                ? detectedCtx : "u:object_r:media_rw_data_file:s0";
-        Shell.Result chconResult = Shell.cmd("chcon '" + ctx + "' '" + path + "'").exec();
-        if (!chconResult.isSuccess()) {
-            if (diagnose) {
-                for (String e : chconResult.getErr()) FixerLog.e("  chcon ERR: " + e);
-                FixerLog.w("  Trying alternative contexts...");
-            }
-            // Try alternative contexts
-            String[] altContexts = {
+        // Set SELinux context
+        Shell.Result chconRes = Shell.cmd("chcon '" + ctx + "' '" + path + "'").exec();
+        if (!chconRes.isSuccess()) {
+            if (diagnose) FixerLog.w("  chcon failed with " + ctx + ", trying alternatives...");
+            String[] alts = {
                 "u:object_r:media_rw_data_file:s0",
+                "u:object_r:media_data_file:s0",
                 "u:object_r:sdcardfs:s0",
                 "u:object_r:fuse:s0",
-                "u:object_r:vfat:s0",
-                "u:object_r:media_data_file:s0",
             };
-            for (String alt : altContexts) {
+            for (String alt : alts) {
                 Shell.Result tryRes = Shell.cmd("chcon '" + alt + "' '" + path + "'").exec();
                 if (tryRes.isSuccess()) {
                     if (diagnose) FixerLog.i("  chcon OK with: " + alt);
+                    ctx = alt;
                     break;
-                } else if (diagnose) {
-                    FixerLog.d("  chcon failed with: " + alt);
                 }
             }
         }
@@ -203,10 +165,24 @@ public class StorageFixer {
         Shell.Result verify = Shell.cmd(
             "[ -d '" + path + "' ] && echo OK || echo FAIL"
         ).exec();
-        boolean ok = !verify.getOut().isEmpty() && "OK".equals(verify.getOut().get(0));
+        return !verify.getOut().isEmpty() && "OK".equals(verify.getOut().get(0));
+    }
 
-        if (diagnose) FixerLog.d("  fixDirSmart result: " + (ok ? "OK" : "FAIL"));
-        return ok;
+    private static boolean fixDir(String path) {
+        return fixDir(path, false);
+    }
+
+    private static void fixSubDirs(String parentPath, boolean diagnose) {
+        for (String sub : SUBDIRS) {
+            String subPath = parentPath + "/" + sub;
+            Shell.cmd(String.join(" && ",
+                "mkdir -p '" + subPath + "'",
+                "chown " + OWNER + " '" + subPath + "'",
+                "chmod " + DIR_PERM + " '" + subPath + "'",
+                "chcon " + SECTX + " '" + subPath + "'")
+            ).exec();
+            if (diagnose) FixerLog.d("  Subdir: " + sub + " created");
+        }
     }
 
     private static String detectContext(String path) {
@@ -220,16 +196,19 @@ public class StorageFixer {
         return null;
     }
 
-    private static void fixSubDirs(String parentPath, boolean diagnose) {
-        for (String sub : SUBDIRS) {
-            String subPath = parentPath + "/" + sub;
-            Shell.cmd(String.join(" && ",
-                "mkdir -p '" + subPath + "'",
-                "chmod " + DIR_PERM + " '" + subPath + "'",
-                "chown " + OWNER + " '" + subPath + "'")
-            ).exec();
-            if (diagnose) FixerLog.d("  Subdir: " + sub + " created");
-        }
+    public static void triggerMediaRescan(String pkg) {
+        FixerLog.i("Triggering media rescan for " + pkg);
+        // Method 1: scan specific paths
+        Shell.cmd(
+            "am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE"
+            + " -d 'file:///storage/emulated/0/Android/data/" + pkg + "'"
+        ).exec();
+        // Method 2: force MediaProvider to rescan volume
+        Shell.cmd(
+            "content call --uri content://media/"
+            + " --method scan_volume --arg external_primary"
+        ).exec();
+        FixerLog.i("Media rescan triggered");
     }
 
     private static boolean testWrite(String path) {
@@ -246,31 +225,35 @@ public class StorageFixer {
         FixerLog.i("Force stopped: " + pkg);
     }
 
+    private static void logParentDirs() {
+        String[] parents = {
+            LOWER + "/data", LOWER + "/obb", LOWER + "/media",
+            FUSE + "/data", FUSE + "/obb", FUSE + "/media"
+        };
+        for (String p : parents) {
+            Shell.Result res = Shell.cmd(
+                "ls -laZd '" + p + "' 2>/dev/null || echo 'MISSING: " + p + "'"
+            ).exec();
+            for (String line : res.getOut())
+                FixerLog.d("  Parent: " + line.trim());
+        }
+    }
+
     private static void logPackageInfo(String pkg) {
         Shell.Result uidRes = Shell.cmd(
             "dumpsys package " + pkg + " | grep userId= | head -1").exec();
         for (String line : uidRes.getOut())
             FixerLog.d("  UID: " + line.trim());
 
-        Shell.Result pathRes = Shell.cmd("pm path " + pkg).exec();
-        for (String line : pathRes.getOut())
-            FixerLog.d("  Path: " + line.trim());
-
         Shell.Result permRes = Shell.cmd(
             "dumpsys package " + pkg
-            + " | grep -E 'storage|STORAGE|READ_MEDIA|MANAGE|READ_EXTERNAL|WRITE_EXTERNAL'"
+            + " | grep -E 'storage|STORAGE|READ_MEDIA|MANAGE|EXTERNAL'"
         ).exec();
         if (!permRes.getOut().isEmpty()) {
             FixerLog.d("  Storage permissions:");
             for (String line : permRes.getOut())
                 FixerLog.d("    " + line.trim());
         }
-
-        Shell.Result mountRes = Shell.cmd(
-            "cat /proc/mounts | grep 'emulated' | head -5").exec();
-        FixerLog.d("  Mounts:");
-        for (String line : mountRes.getOut())
-            FixerLog.d("    " + line.trim());
     }
 
     private static void logDirState(String label, String path) {
@@ -303,82 +286,57 @@ public class StorageFixer {
         // System info
         Shell.Result sdkRes = Shell.cmd("getprop ro.build.version.sdk").exec();
         Shell.Result romRes = Shell.cmd("getprop ro.build.display.id").exec();
-        Shell.Result kernRes = Shell.cmd("uname -r").exec();
         FixerLog.i("SDK: " + join(sdkRes.getOut()));
         FixerLog.i("ROM: " + join(romRes.getOut()));
-        FixerLog.i("Kernel: " + join(kernRes.getOut()));
 
-        // FUSE vs sdcardfs
+        // FUSE info
         Shell.Result fsRes = Shell.cmd("mount | grep emulated | head -5").exec();
-        FixerLog.i("Storage filesystem:");
+        FixerLog.i("Storage mounts:");
         for (String line : fsRes.getOut())
             FixerLog.i("  " + line.trim());
 
         // Root method
         Shell.Result magiskRes = Shell.cmd("magisk -v 2>/dev/null").exec();
         Shell.Result ksuRes = Shell.cmd(
-            "ksud --version 2>/dev/null; ksu_susfs --version 2>/dev/null"
-        ).exec();
+            "ksud --version 2>/dev/null; ksu --version 2>/dev/null").exec();
         FixerLog.i("Magisk: " + join(magiskRes.getOut()));
         FixerLog.i("KernelSU: " + join(ksuRes.getOut()));
 
-        // Check if Android/media parent exists
-        Shell.Result mediaParent = Shell.cmd(
-            "ls -laZd /storage/emulated/0/Android/media/ 2>/dev/null"
-            + " || echo 'Android/media DOES NOT EXIST'"
+        // SELinux status
+        Shell.Result seRes = Shell.cmd("getenforce").exec();
+        FixerLog.i("SELinux: " + join(seRes.getOut()));
+
+        // Check for avc denials related to this package
+        Shell.Result avcRes = Shell.cmd(
+            "dmesg | grep -i 'avc.*denied' | grep -i '"
+            + pkg.replace(".", "\\.") + "' | tail -10 2>/dev/null"
+            + " || echo 'No AVC denials found (or no access to dmesg)'"
         ).exec();
-        FixerLog.i("Media parent:");
-        for (String line : mediaParent.getOut())
+        FixerLog.i("SELinux denials:");
+        for (String line : avcRes.getOut())
             FixerLog.i("  " + line.trim());
 
-        // Check mount namespace
-        Shell.Result nsRes = Shell.cmd(
-            "ls -la /proc/self/ns/mnt 2>/dev/null"
+        // Check for general storage AVC denials
+        Shell.Result avcStorageRes = Shell.cmd(
+            "dmesg | grep -i 'avc.*denied.*media' | tail -10 2>/dev/null"
+            + " || echo 'No media AVC denials'"
         ).exec();
-        FixerLog.i("Mount namespace: " + join(nsRes.getOut()));
-
-        // Check FUSE implementation
-        Shell.Result fuseRes = Shell.cmd(
-            "ps -ef | grep -i fuse | grep -v grep | head -5"
-        ).exec();
-        FixerLog.i("FUSE processes:");
-        for (String line : fuseRes.getOut())
+        FixerLog.i("Media AVC denials:");
+        for (String line : avcStorageRes.getOut())
             FixerLog.i("  " + line.trim());
 
         // Now do the fix with full diagnostics
         fixPackage(pkg, true);
 
-        // Post-fix: check from different paths
-        FixerLog.i("=== PATH VERIFICATION ===");
-        String[] paths = {
-            "/storage/emulated/0/Android/data/" + pkg,
-            "/data/media/0/Android/data/" + pkg,
-            "/mnt/user/0/emulated/0/Android/data/" + pkg,
-            "/mnt/pass_through/0/emulated/0/Android/data/" + pkg,
-        };
-        for (String p : paths) {
-            Shell.Result check = Shell.cmd(
-                "ls -laZd '" + p + "' 2>/dev/null || echo 'NOT FOUND: " + p + "'"
-            ).exec();
-            for (String line : check.getOut())
-                FixerLog.i("  " + line.trim());
-        }
+        // Trigger rescan
+        triggerMediaRescan(pkg);
 
-        // Check the underlying data path (bypass FUSE)
-        FixerLog.i("=== UNDERLYING STORAGE (bypass FUSE) ===");
-        Shell.Result underRes = Shell.cmd(
-            "ls -laZd /data/media/0/Android/data/" + pkg + " 2>/dev/null"
-            + " || echo 'Not found in /data/media/0/'"
-        ).exec();
-        for (String line : underRes.getOut())
-            FixerLog.i("  " + line.trim());
-
-        Shell.Result underMediaRes = Shell.cmd(
-            "ls -laZd /data/media/0/Android/media/" + pkg + " 2>/dev/null"
-            + " || echo 'Not found in /data/media/0/Android/media/'"
-        ).exec();
-        for (String line : underMediaRes.getOut())
-            FixerLog.i("  " + line.trim());
+        // Wait and verify FUSE picked it up
+        try { Thread.sleep(2000); } catch (InterruptedException ignored) {}
+        FixerLog.i("=== POST-RESCAN FUSE VERIFICATION ===");
+        logDirState("FUSE-FINAL", FUSE + "/data/" + pkg);
+        logDirState("FUSE-FINAL", FUSE + "/obb/" + pkg);
+        logDirState("FUSE-FINAL", FUSE + "/media/" + pkg);
 
         FixerLog.divider();
     }
@@ -396,6 +354,9 @@ public class StorageFixer {
             results.add(r);
             if (r.success) ok++;
         }
+
+        // Trigger single volume rescan after fixing all
+        triggerMediaRescan("*");
         FixerLog.i("Scan done: " + ok + "/" + results.size() + " fixed");
         return results;
     }
@@ -415,7 +376,7 @@ public class StorageFixer {
 
         @Override
         public String toString() {
-            return (success ? "V " : "X ") + packageName
+            return (success ? "OK " : "FAIL ") + packageName
                     + " [data:" + (dataOk ? "ok" : "fail")
                     + " obb:" + (obbOk ? "ok" : "fail")
                     + " media:" + (mediaOk ? "ok" : "fail")
