@@ -15,6 +15,20 @@
         android:theme="@style/Theme.StorageFixer"
         android:supportsRtl="true">
 
+        <!-- Xposed Module metadata -->
+        <meta-data
+            android:name="xposedmodule"
+            android:value="true" />
+        <meta-data
+            android:name="xposeddescription"
+            android:value="Fixes Android 16 storage permissions and FileProvider bind-mount crashes" />
+        <meta-data
+            android:name="xposedminversion"
+            android:value="93" />
+        <meta-data
+            android:name="xposedscope"
+            android:resource="@array/xposed_scope" />
+
         <activity
             android:name=".MainActivity"
             android:exported="true">
