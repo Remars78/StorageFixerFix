@@ -19,27 +19,19 @@ public class PackageReceiver extends BroadcastReceiver {
         PendingResult pending = goAsync();
         new Thread(() -> {
             try {
-                // Wait 10s for vold to try AND FAIL completely
-                // This is critical - we must fix AFTER vold gives up
-                FixerLog.i("Waiting 10s for vold to settle...");
+                // Wait 10s for vold to try and fail
+                FixerLog.i("Waiting 10s for vold...");
                 Thread.sleep(10000);
 
-                // Check if fix is needed
                 if (!StorageFixer.needsFix(pkg)) {
-                    FixerLog.i("  " + pkg + " dirs OK, skipping");
+                    FixerLog.i(pkg + " dirs OK, skipping");
                     return;
                 }
 
-                // Fix (matching manual fix exactly)
                 FixerLog.i("Fixing " + pkg + "...");
-                StorageFixer.FixResult r = StorageFixer.fixPackage(pkg);
-
-                // Force stop so app gets fresh FUSE mount on next launch
+                StorageFixer.FixResult r = StorageFixer.fixPackage(context, pkg);
                 StorageFixer.forceStopPackage(pkg);
-
-                // Rescan
                 StorageFixer.triggerMediaRescan();
-
                 FixerLog.i("Auto-fix done: " + r);
 
             } catch (InterruptedException ignored) {
