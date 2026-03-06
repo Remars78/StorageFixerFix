@@ -36,5 +36,5 @@ dependencies {
     implementation("com.github.topjohnwu.libsu:core:5.2.2")
 
     // Xposed API (compile only - provided by LSPosed at runtime)
-    compileOnly("com.github.rovo89:XposedBridge:82")
+    compileOnly("de.robv.android.xposed:api:82")
 }
